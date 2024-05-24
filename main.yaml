@@ -1,0 +1,330 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Template para provisionar arquitetura AWS com ALB, EC2, Auto Scaling e DynamoDB
+
+Parameters:
+  SSHLocation:
+    Description: IP range permitido para SSH nas instâncias EC2
+    Type: String
+    MinLength: 9
+    MaxLength: 18
+    Default: 0.0.0.0/0
+    ConstraintDescription: deve ser um CIDR válido do formato x.x.x.x/x.
+
+Resources:
+  # Configuração do VPC
+  VPCProjetoAmaral:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+
+  PublicSubnet1Amaral:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPCProjetoAmaral
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: us-east-1a
+      MapPublicIpOnLaunch: true
+
+  PublicSubnet2Amaral:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPCProjetoAmaral
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: us-east-1b
+      MapPublicIpOnLaunch: true
+
+  PrivateSubnet1Amaral:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPCProjetoAmaral
+      CidrBlock: 10.0.3.0/24
+      AvailabilityZone: us-east-1a
+
+  PrivateSubnet2Amaral:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPCProjetoAmaral
+      CidrBlock: 10.0.4.0/24
+      AvailabilityZone: us-east-1b
+
+  IGWAmaral:
+    Type: AWS::EC2::InternetGateway
+
+  AttachIGWAmaral:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPCProjetoAmaral
+      InternetGatewayId: !Ref IGWAmaral
+
+  RouterAmaral:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPCProjetoAmaral
+
+  RouterToIGWAmaral:
+    Type: AWS::EC2::Route
+    DependsOn: IGWAmaral
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref IGWAmaral
+      RouteTableId: !Ref RouterAmaral
+
+  RTAssoc1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref RouterAmaral
+      SubnetId: !Ref PublicSubnet1Amaral
+
+  RTAssoc2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref RouterAmaral
+      SubnetId: !Ref PublicSubnet2Amaral
+
+  # Security Groups
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VPCProjetoAmaral
+      GroupDescription: "Enable SSH access and HTTP from the ALB"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHLocation
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  # IAM Role
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Scan
+                  - dynamodb:Query
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                Resource: "*"
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2InstanceRole
+
+  # Load Balancer
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: "ALB-Amaral"
+      Subnets:
+        - !Ref PublicSubnet1Amaral
+        - !Ref PublicSubnet2Amaral
+      SecurityGroups: 
+        - !Ref InstanceSecurityGroup
+
+  LoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 5
+      UnhealthyThresholdCount: 2
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VPCProjetoAmaral
+
+  LaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      ImageId: ami-0bb84b8ffd87024d8
+      InstanceType: t2.medium
+      IamInstanceProfile: !Ref InstanceProfile
+      SecurityGroups:
+        - !Ref InstanceSecurityGroup
+      UserData: 
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+          set -x
+
+          echo "Starting user-data script" | logger -t user-data
+
+          # Função para instalar pacotes usando yum ou apt-get
+          install_packages() {
+            if command -v yum &> /dev/null; then
+              echo "Using yum to install packages" | logger -t user-data
+              yum update -y
+              yum install -y python3 python3-pip
+              yum install -y httpd
+              yum install -y mod_cgi
+              systemctl start httpd
+              systemctl enable httpd
+            elif command -v apt-get &> /dev/null; then
+              echo "Using apt-get to install packages" | logger -t user-data
+              apt-get update -y
+              apt-get upgrade -y
+              apt-get install -y python3-pip
+              apt-get install -y apache2
+            else
+              echo "No supported package manager found (yum or apt-get)" | logger -t user-data
+              exit 1
+            fi
+          }
+
+          # Instalar pacotes
+          install_packages
+
+          # Instalar boto3
+          pip3 install boto3
+
+          # Criar página HTML
+          mkdir -p /var/www/html
+          cat <<EOF > /var/www/html/index.html
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+              <meta charset="UTF-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1.0">
+              <title>Save to DynamoDB</title>
+          </head>
+          <body>
+              <h1>Enter Your Name</h1>
+              <form action="/cgi-bin/save.py" method="post">
+                  <label for="name">Name:</label>
+                  <input type="text" id="name" name="name"><br><br>
+                  <input type="submit" value="Submit">
+              </form>
+          </body>
+          </html>
+          EOF
+
+          # Criar script CGI
+          mkdir -p /var/www/cgi-bin
+          cat <<EOF > /var/www/cgi-bin/save.py
+          #!/usr/bin/env python3
+          import cgi
+          import cgitb
+          import boto3
+          import uuid
+
+          cgitb.enable()
+          print("Content-Type: text/html")
+          print()
+
+          form = cgi.FieldStorage()
+          name = form.getvalue("name")
+
+          if name:
+              dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
+              table = dynamodb.Table('TableAmaral')
+              table.put_item(Item={'Id': str(uuid.uuid4()), 'Name': name})
+              print("Data saved to DynamoDB")
+          else:
+              print("No data received")
+          EOF
+
+          chmod +x /var/www/cgi-bin/save.py
+
+          # Configurar Apache para permitir CGI
+          if command -v yum &> /dev/null; then
+              sed -i 's/^#AddHandler cgi-script .cgi/AddHandler cgi-script .cgi .py/' /etc/httpd/conf/httpd.conf
+              sed -i 's/^#LoadModule cgi_module modules\/mod_cgi.so/LoadModule cgi_module modules\/mod_cgi.so/' /etc/httpd/conf/httpd.conf
+              echo "<Directory \"/var/www/cgi-bin\">\n    AllowOverride None\n    Options +ExecCGI\n    Require all granted\n</Directory>" >> /etc/httpd/conf/httpd.conf
+              systemctl enable httpd
+              systemctl start httpd
+          elif command -v apt-get &> /dev/null; then
+              a2enmod cgi
+              echo "<Directory \"/var/www/cgi-bin\">\n    AllowOverride None\n    Options +ExecCGI\n    Require all granted\n</Directory>" >> /etc/apache2/apache2.conf
+              systemctl enable apache2
+              systemctl start apache2
+          fi
+
+          echo "User-data script completed" | logger -t user-data
+          # Verificar se o Apache está rodando
+          if systemctl status httpd || systemctl status apache2; then
+              echo "Apache is running" | logger -t user-data
+          else
+              echo "Apache failed to start" | logger -t user-data
+              exit 1
+          fi
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet1Amaral
+        - !Ref PublicSubnet2Amaral
+      LaunchConfigurationName: !Ref LaunchConfig
+      MinSize: 1
+      MaxSize: 3
+      DesiredCapacity: 1
+      TargetGroupARNs:
+        - !Ref TargetGroup
+
+  # Scaling Policies
+  ScaleUpPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 70.0
+
+  # DynamoDB
+  DynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: "TableAmaral"
+      AttributeDefinitions:
+        - AttributeName: "Id"
+          AttributeType: "S"
+      KeySchema:
+        - AttributeName: "Id"
+          KeyType: "HASH"
+      BillingMode: PAY_PER_REQUEST
+      Tags:
+        - Key: "Name"
+          Value: "TableAmaral"
+
+  DynamoDBEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPCProjetoAmaral
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.dynamodb'
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref RouterAmaral
